@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: device-api-proxy
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: "python server.py"
+    healthCheckPath: /health
+    envVars:
+      - key: DEVICE_PLATFORM_BASE_URL
+        value: http://182.40.193.119:8081
+      - key: DEVICE_PLATFORM_USERNAME
+        sync: false
+      - key: DEVICE_PLATFORM_PASSWORD
+        sync: false
+      - key: DEVICE_NAMES
+        value: 26052705XJX-X1,26052705XJX-X2,26052705XJX-X3,25122225XJX-X4
+      - key: FRONTEND_ORIGIN
+        sync: false
