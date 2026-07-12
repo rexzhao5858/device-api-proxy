@@ -1,0 +1,54 @@
+name: Daily all-factors export
+
+on:
+  schedule:
+    # 00:00 Asia/Shanghai.
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+    inputs:
+      export_date:
+        description: "Date to export in YYYY-MM-DD format. Defaults to yesterday in Asia/Shanghai."
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    env:
+      DEVICE_PLATFORM_BASE_URL: ${{ secrets.DEVICE_PLATFORM_BASE_URL }}
+      DEVICE_PLATFORM_USERNAME: ${{ secrets.DEVICE_PLATFORM_USERNAME }}
+      DEVICE_PLATFORM_PASSWORD: ${{ secrets.DEVICE_PLATFORM_PASSWORD }}
+      DEVICE_NAMES: ${{ secrets.DEVICE_NAMES }}
+      EXPORT_TIMEZONE: Asia/Shanghai
+      EXPORT_DATE: ${{ inputs.export_date }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Export all factors
+        run: python3 scripts/export_all_factors.py
+
+      - name: Commit export files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add exports/
+          if git diff --cached --quiet; then
+            echo "No export changes to commit."
+            exit 0
+          fi
+          if [ -n "${EXPORT_DATE}" ]; then
+            COMMIT_DATE="${EXPORT_DATE}"
+          else
+            COMMIT_DATE="$(TZ=Asia/Shanghai date -d 'yesterday' +%F)"
+          fi
+          git commit -m "Export all factors for ${COMMIT_DATE}"
+          git push
