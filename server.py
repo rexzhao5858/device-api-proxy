@@ -3,7 +3,7 @@ import os
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 
@@ -28,6 +28,8 @@ SIGNAL_KEYS = ["RSSI", "sig4g", "sigwifi", "rssi", "signal", "signalStrength"]
 TOKEN = None
 TOKEN_TS = 0
 TOKEN_TTL_SECONDS = 50 * 60
+MAX_HISTORY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
+DEFAULT_HISTORY_RANGE_MS = 24 * 60 * 60 * 1000
 
 
 class UpstreamError(Exception):
@@ -176,6 +178,18 @@ def pick_max(values, candidate_keys):
     return best
 
 
+def stats_for_points(points):
+    nums = [point["value"] for point in points]
+    if not nums:
+        return {"count": 0, "min": None, "max": None, "avg": None}
+    return {
+        "count": len(nums),
+        "min": min(nums),
+        "max": max(nums),
+        "avg": sum(nums) / len(nums),
+    }
+
+
 def format_ts(ts):
     if ts is None:
         return None
@@ -183,6 +197,23 @@ def format_ts(ts):
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(ts) / 1000))
     except (TypeError, ValueError, OSError):
         return None
+
+
+def parse_history_range(query):
+    now_ms = int(time.time() * 1000)
+    try:
+        start_ts = int((query.get("startTs") or [now_ms - DEFAULT_HISTORY_RANGE_MS])[0])
+        end_ts = int((query.get("endTs") or [now_ms])[0])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("startTs and endTs must be millisecond timestamps") from exc
+
+    if start_ts <= 0 or end_ts <= 0:
+        raise ValueError("startTs and endTs must be positive")
+    if end_ts <= start_ts:
+        raise ValueError("endTs must be greater than startTs")
+    if end_ts - start_ts > MAX_HISTORY_RANGE_MS:
+        raise ValueError("Time range cannot exceed 7 days")
+    return start_ts, end_ts
 
 
 def get_weekly_max_wind(entity_type, entity_id, keys):
@@ -206,6 +237,66 @@ def get_weekly_max_wind(entity_type, entity_id, keys):
     )
     values = values if isinstance(values, dict) else {}
     return pick_max(values, WIND_KEYS)
+
+
+def get_wind_history(device, start_ts, end_ts):
+    entity_type, entity_id = entity_from_device(device)
+    if not entity_id:
+        return {
+            "id": None,
+            "name": device.get("name"),
+            "unit": "m/s",
+            "points": [],
+            "stats": stats_for_points([]),
+            "error": "Missing device id",
+        }
+
+    keys = authed_json("GET", f"/api/plugins/telemetry/{entity_type}/{entity_id}/keys/timeseries")
+    keys = keys if isinstance(keys, list) else []
+    wind_keys = [key for key in WIND_KEYS if key in keys]
+    if not wind_keys:
+        return {
+            "id": entity_id,
+            "name": device.get("name"),
+            "unit": "m/s",
+            "points": [],
+            "stats": stats_for_points([]),
+        }
+
+    values = authed_json(
+        "GET",
+        f"/api/plugins/telemetry/{entity_type}/{entity_id}/values/timeseries",
+        query={
+            "keys": ",".join(wind_keys),
+            "startTs": start_ts,
+            "endTs": end_ts,
+            "interval": 0,
+            "limit": 20000,
+            "agg": "NONE",
+        },
+    )
+    values = values if isinstance(values, dict) else {}
+
+    points_by_ts = {}
+    for key in wind_keys:
+        for item in values.get(key, []) or []:
+            numeric = number_value(item.get("value"))
+            ts = item.get("ts")
+            if numeric is None or ts is None:
+                continue
+            points_by_ts[int(ts)] = {
+                "ts": int(ts),
+                "time": format_ts(ts),
+                "value": numeric,
+            }
+    points = [points_by_ts[ts] for ts in sorted(points_by_ts)]
+    return {
+        "id": entity_id,
+        "name": device.get("name"),
+        "unit": "m/s",
+        "points": points,
+        "stats": stats_for_points(points),
+    }
 
 
 def get_device_summary(device):
@@ -241,18 +332,31 @@ def get_device_summary(device):
     }
 
 
-def summary_payload():
+def select_target_devices():
     devices = get_device_infos()
     by_name = {device.get("name"): device for device in devices}
     selected = [by_name[name] for name in DEVICE_NAMES if name in by_name]
-    if not selected:
-        selected = devices[:4]
+    return selected if selected else devices[:4]
 
+
+def summary_payload():
+    selected = select_target_devices()
     summaries = [get_device_summary(device) for device in selected]
     return {
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "deviceCount": len(summaries),
         "devices": summaries,
+    }
+
+
+def wind_history_payload(query):
+    start_ts, end_ts = parse_history_range(query)
+    devices = [get_wind_history(device, start_ts, end_ts) for device in select_target_devices()]
+    return {
+        "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "startTs": start_ts,
+        "endTs": end_ts,
+        "devices": devices,
     }
 
 
@@ -268,13 +372,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/health":
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/health":
             json_response(self, 200, {"ok": True})
             return
 
-        if self.path.startswith("/api/devices/summary"):
+        if parsed.path == "/api/devices/summary":
             try:
                 json_response(self, 200, summary_payload())
+            except UpstreamError as exc:
+                json_response(self, 502, {"error": str(exc)})
+            except Exception as exc:
+                json_response(self, 500, {"error": f"Unexpected error: {exc}"})
+            return
+
+        if parsed.path == "/api/devices/wind-history":
+            try:
+                json_response(self, 200, wind_history_payload(parse_qs(parsed.query)))
+            except ValueError as exc:
+                json_response(self, 400, {"error": str(exc)})
             except UpstreamError as exc:
                 json_response(self, 502, {"error": str(exc)})
             except Exception as exc:
