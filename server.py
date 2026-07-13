@@ -30,6 +30,7 @@ TOKEN_TS = 0
 TOKEN_TTL_SECONDS = 50 * 60
 MAX_HISTORY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 DEFAULT_HISTORY_RANGE_MS = 24 * 60 * 60 * 1000
+ONLINE_STALE_SECONDS = int(os.getenv("ONLINE_STALE_SECONDS", "600"))
 
 
 class UpstreamError(Exception):
@@ -151,6 +152,23 @@ def pick_latest(values, candidate_keys):
                 "time": format_ts(item.get("ts")),
             }
     return None
+
+
+def latest_metric_ts(*metrics):
+    timestamps = []
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            continue
+        ts = metric.get("ts")
+        if isinstance(ts, (int, float)):
+            timestamps.append(ts)
+    return max(timestamps) if timestamps else None
+
+
+def is_online(latest_ts):
+    if not latest_ts:
+        return False
+    return time.time() * 1000 - latest_ts <= ONLINE_STALE_SECONDS * 1000
 
 
 def number_value(value):
@@ -321,6 +339,7 @@ def get_device_summary(device):
     wind = pick_latest(values, WIND_KEYS)
     weekly_max_wind = get_weekly_max_wind(entity_type, entity_id, keys)
     signal = pick_latest(values, SIGNAL_KEYS)
+    last_telemetry_ts = latest_metric_ts(voltage, wind, signal)
     return {
         "id": entity_id,
         "name": device.get("name"),
@@ -328,7 +347,9 @@ def get_device_summary(device):
         "wind": wind,
         "weeklyMaxWind": weekly_max_wind,
         "signal": signal,
-        "online": True,
+        "lastTelemetryTs": last_telemetry_ts,
+        "lastTelemetryTime": format_ts(last_telemetry_ts),
+        "online": is_online(last_telemetry_ts),
     }
 
 
@@ -342,9 +363,13 @@ def select_target_devices():
 def summary_payload():
     selected = select_target_devices()
     summaries = [get_device_summary(device) for device in selected]
+    online_count = sum(1 for summary in summaries if summary.get("online"))
     return {
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "deviceCount": len(summaries),
+        "onlineCount": online_count,
+        "offlineCount": len(summaries) - online_count,
+        "onlineStaleSeconds": ONLINE_STALE_SECONDS,
         "devices": summaries,
     }
 
