@@ -1,7 +1,9 @@
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -27,10 +29,18 @@ SIGNAL_KEYS = ["RSSI", "sig4g", "sigwifi", "rssi", "signal", "signalStrength"]
 
 TOKEN = None
 TOKEN_TS = 0
+TOKEN_LOCK = Lock()
 TOKEN_TTL_SECONDS = 50 * 60
 MAX_HISTORY_RANGE_MS = 7 * 24 * 60 * 60 * 1000
 DEFAULT_HISTORY_RANGE_MS = 24 * 60 * 60 * 1000
 ONLINE_STALE_SECONDS = int(os.getenv("ONLINE_STALE_SECONDS", "600"))
+MAX_WORKERS = max(1, int(os.getenv("DEVICE_FETCH_WORKERS", "4")))
+DEVICE_CACHE_SECONDS = int(os.getenv("DEVICE_CACHE_SECONDS", "300"))
+TELEMETRY_KEYS_CACHE_SECONDS = int(os.getenv("TELEMETRY_KEYS_CACHE_SECONDS", "1800"))
+WEEKLY_MAX_CACHE_SECONDS = int(os.getenv("WEEKLY_MAX_CACHE_SECONDS", "300"))
+
+CACHE = {}
+CACHE_LOCK = Lock()
 
 
 class UpstreamError(Exception):
@@ -90,17 +100,22 @@ def get_token(force=False):
     if not force and TOKEN and now - TOKEN_TS < TOKEN_TTL_SECONDS:
         return TOKEN
 
-    data = request_json(
-        "POST",
-        "/api/auth/login",
-        body={"username": USERNAME, "password": PASSWORD},
-    )
-    token = data.get("token") if isinstance(data, dict) else None
-    if not token:
-        raise UpstreamError("Login response did not include token")
-    TOKEN = token
-    TOKEN_TS = now
-    return TOKEN
+    with TOKEN_LOCK:
+        now = time.time()
+        if not force and TOKEN and now - TOKEN_TS < TOKEN_TTL_SECONDS:
+            return TOKEN
+
+        data = request_json(
+            "POST",
+            "/api/auth/login",
+            body={"username": USERNAME, "password": PASSWORD},
+        )
+        token = data.get("token") if isinstance(data, dict) else None
+        if not token:
+            raise UpstreamError("Login response did not include token")
+        TOKEN = token
+        TOKEN_TS = now
+        return TOKEN
 
 
 def authed_json(method, path, body=None, query=None):
@@ -114,23 +129,47 @@ def authed_json(method, path, body=None, query=None):
     return request_json(method, path, token=token, body=body, query=query)
 
 
+def cached_value(key, ttl_seconds, loader):
+    now = time.time()
+    with CACHE_LOCK:
+        item = CACHE.get(key)
+        if item and now - item["ts"] < ttl_seconds:
+            return item["value"]
+
+    value = loader()
+    with CACHE_LOCK:
+        CACHE[key] = {"ts": now, "value": value}
+    return value
+
+
+def run_for_devices(devices, loader):
+    if not devices:
+        return []
+    workers = min(MAX_WORKERS, len(devices))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(loader, devices))
+
+
 def get_user():
     return authed_json("GET", "/api/auth/user/")
 
 
 def get_device_infos():
-    user = get_user()
-    authority = user.get("authority")
-    customer_id = ((user.get("customerId") or {}).get("id")) if isinstance(user, dict) else None
-    if authority == "TENANT_ADMIN" or not customer_id:
-        data = authed_json("GET", "/api/tenant/deviceInfos", query={"pageSize": 1000, "page": 0})
-    else:
-        data = authed_json(
-            "GET",
-            f"/api/customer/{customer_id}/deviceInfos",
-            query={"pageSize": 1000, "page": 0},
-        )
-    return data.get("data", []) if isinstance(data, dict) else []
+    def load():
+        user = get_user()
+        authority = user.get("authority")
+        customer_id = ((user.get("customerId") or {}).get("id")) if isinstance(user, dict) else None
+        if authority == "TENANT_ADMIN" or not customer_id:
+            data = authed_json("GET", "/api/tenant/deviceInfos", query={"pageSize": 1000, "page": 0})
+        else:
+            data = authed_json(
+                "GET",
+                f"/api/customer/{customer_id}/deviceInfos",
+                query={"pageSize": 1000, "page": 0},
+            )
+        return data.get("data", []) if isinstance(data, dict) else []
+
+    return cached_value("device_infos", DEVICE_CACHE_SECONDS, load)
 
 
 def entity_from_device(device):
@@ -234,27 +273,40 @@ def parse_history_range(query):
     return start_ts, end_ts
 
 
+def get_timeseries_keys(entity_type, entity_id):
+    key = ("timeseries_keys", entity_type, entity_id)
+    return cached_value(
+        key,
+        TELEMETRY_KEYS_CACHE_SECONDS,
+        lambda: authed_json("GET", f"/api/plugins/telemetry/{entity_type}/{entity_id}/keys/timeseries"),
+    )
+
+
 def get_weekly_max_wind(entity_type, entity_id, keys):
     wind_keys = [key for key in WIND_KEYS if key in keys]
     if not wind_keys:
         return None
 
-    end_ts = int(time.time() * 1000)
-    start_ts = end_ts - 7 * 24 * 60 * 60 * 1000
-    values = authed_json(
-        "GET",
-        f"/api/plugins/telemetry/{entity_type}/{entity_id}/values/timeseries",
-        query={
-            "keys": ",".join(wind_keys),
-            "startTs": start_ts,
-            "endTs": end_ts,
-            "interval": 0,
-            "limit": 20000,
-            "agg": "NONE",
-        },
-    )
-    values = values if isinstance(values, dict) else {}
-    return pick_max(values, WIND_KEYS)
+    def load():
+        end_ts = int(time.time() * 1000)
+        start_ts = end_ts - 7 * 24 * 60 * 60 * 1000
+        values = authed_json(
+            "GET",
+            f"/api/plugins/telemetry/{entity_type}/{entity_id}/values/timeseries",
+            query={
+                "keys": ",".join(wind_keys),
+                "startTs": start_ts,
+                "endTs": end_ts,
+                "interval": 0,
+                "limit": 20000,
+                "agg": "NONE",
+            },
+        )
+        values = values if isinstance(values, dict) else {}
+        return pick_max(values, WIND_KEYS)
+
+    cache_key = ("weekly_max_wind", entity_type, entity_id, tuple(wind_keys))
+    return cached_value(cache_key, WEEKLY_MAX_CACHE_SECONDS, load)
 
 
 def get_wind_history(device, start_ts, end_ts):
@@ -269,7 +321,7 @@ def get_wind_history(device, start_ts, end_ts):
             "error": "Missing device id",
         }
 
-    keys = authed_json("GET", f"/api/plugins/telemetry/{entity_type}/{entity_id}/keys/timeseries")
+    keys = get_timeseries_keys(entity_type, entity_id)
     keys = keys if isinstance(keys, list) else []
     wind_keys = [key for key in WIND_KEYS if key in keys]
     if not wind_keys:
@@ -322,7 +374,7 @@ def get_device_summary(device):
     if not entity_id:
         return {"name": device.get("name"), "error": "Missing device id"}
 
-    keys = authed_json("GET", f"/api/plugins/telemetry/{entity_type}/{entity_id}/keys/timeseries")
+    keys = get_timeseries_keys(entity_type, entity_id)
     keys = keys if isinstance(keys, list) else []
     wanted_keys = [key for key in VOLTAGE_KEYS + WIND_KEYS + SIGNAL_KEYS if key in keys]
     if not wanted_keys:
@@ -362,7 +414,7 @@ def select_target_devices():
 
 def summary_payload():
     selected = select_target_devices()
-    summaries = [get_device_summary(device) for device in selected]
+    summaries = run_for_devices(selected, get_device_summary)
     online_count = sum(1 for summary in summaries if summary.get("online"))
     return {
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -376,7 +428,10 @@ def summary_payload():
 
 def wind_history_payload(query):
     start_ts, end_ts = parse_history_range(query)
-    devices = [get_wind_history(device, start_ts, end_ts) for device in select_target_devices()]
+    devices = run_for_devices(
+        select_target_devices(),
+        lambda device: get_wind_history(device, start_ts, end_ts),
+    )
     return {
         "updatedAt": time.strftime("%Y-%m-%d %H:%M:%S"),
         "startTs": start_ts,
