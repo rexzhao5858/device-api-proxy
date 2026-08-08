@@ -1,0 +1,19 @@
+name: Keep Render Service Awake
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping Render health endpoint
+        run: |
+          curl --fail --show-error --silent --max-time 30 --retry 2 --retry-delay 5 \
+            https://device-api-proxy.onrender.com/health
