@@ -552,7 +552,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
-            json_response(self, 200, {"ok": True})
+            json_response(self, 200, {
+                "ok": True,
+                "commit": os.getenv("RENDER_GIT_COMMIT") or os.getenv("RENDER_GIT_COMMIT_SHA"),
+            })
             return
 
         if parsed.path == "/api/devices/summary":
