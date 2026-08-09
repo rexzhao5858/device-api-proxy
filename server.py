@@ -555,7 +555,7 @@ class Handler(BaseHTTPRequestHandler):
             json_response(self, 200, {
                 "ok": True,
                 "commit": os.getenv("RENDER_GIT_COMMIT") or os.getenv("RENDER_GIT_COMMIT_SHA"),
-                "autoDeploy": "on-commit",
+                "autoDeploy": "github-provider",
             })
             return
 
