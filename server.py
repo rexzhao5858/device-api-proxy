@@ -283,19 +283,48 @@ def get_timeseries_keys(entity_type, entity_id):
     )
 
 
-def high_wind_duration(points, threshold, start_ts, end_ts):
+def high_wind_periods(points, threshold, start_ts, end_ts):
     if len(points) < 2:
-        return 0
+        return {"durationMs": 0, "periods": []}
 
     duration_ms = 0
+    periods = []
+    active_period = None
     for current, following in zip(points, points[1:]):
         if current["value"] <= threshold:
+            active_period = None
             continue
+
         segment_start = max(current["ts"], start_ts)
         segment_end = min(following["ts"], end_ts)
-        if segment_end > segment_start:
-            duration_ms += segment_end - segment_start
-    return duration_ms
+        if segment_end <= segment_start:
+            continue
+
+        duration_ms += segment_end - segment_start
+        if active_period and active_period["endTs"] == segment_start:
+            active_period["endTs"] = segment_end
+            active_period["durationMs"] += segment_end - segment_start
+        else:
+            active_period = {
+                "startTs": segment_start,
+                "endTs": segment_end,
+                "durationMs": segment_end - segment_start,
+            }
+            periods.append(active_period)
+
+    return {
+        "durationMs": duration_ms,
+        "periods": [
+            {
+                **period,
+                "startTime": format_ts(period["startTs"]),
+                "endTime": format_ts(period["endTs"]),
+                "durationSeconds": round(period["durationMs"] / 1000),
+                "formatted": format_duration(period["durationMs"]),
+            }
+            for period in periods
+        ],
+    }
 
 
 def format_duration(duration_ms):
@@ -344,7 +373,8 @@ def get_weekly_wind_stats(entity_type, entity_id, keys):
                     points_by_ts[ts] = {"ts": ts, "value": numeric}
 
         points = [points_by_ts[ts] for ts in sorted(points_by_ts)]
-        duration_ms = high_wind_duration(points, HIGH_WIND_THRESHOLD, start_ts, end_ts)
+        high_wind = high_wind_periods(points, HIGH_WIND_THRESHOLD, start_ts, end_ts)
+        duration_ms = high_wind["durationMs"]
         return {
             "max": pick_max(values, WIND_KEYS),
             "highWindDuration": {
@@ -352,6 +382,7 @@ def get_weekly_wind_stats(entity_type, entity_id, keys):
                 "durationMs": duration_ms,
                 "durationSeconds": round(duration_ms / 1000),
                 "formatted": format_duration(duration_ms),
+                "periods": high_wind["periods"],
             },
         }
 
@@ -365,6 +396,7 @@ def zero_high_wind_duration():
         "durationMs": 0,
         "durationSeconds": 0,
         "formatted": format_duration(0),
+        "periods": [],
     }
 
 
