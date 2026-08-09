@@ -26,6 +26,7 @@ PORT = int(os.getenv("PORT", "8080"))
 VOLTAGE_KEYS = ["pow", "BVoltage", "SVoltage", "Voltage", "Voltage1", "Voltage2", "Voltage3", "Voltage4"]
 WIND_KEYS = ["windSpeed", "winspeed", "wsp", "wS", "d1", "HCwind"]
 SIGNAL_KEYS = ["RSSI", "sig4g", "sigwifi", "rssi", "signal", "signalStrength"]
+HIGH_WIND_THRESHOLD = float(os.getenv("HIGH_WIND_THRESHOLD", "29"))
 
 TOKEN = None
 TOKEN_TS = 0
@@ -282,10 +283,36 @@ def get_timeseries_keys(entity_type, entity_id):
     )
 
 
-def get_weekly_max_wind(entity_type, entity_id, keys):
+def high_wind_duration(points, threshold, start_ts, end_ts):
+    if len(points) < 2:
+        return 0
+
+    duration_ms = 0
+    for current, following in zip(points, points[1:]):
+        if current["value"] <= threshold:
+            continue
+        segment_start = max(current["ts"], start_ts)
+        segment_end = min(following["ts"], end_ts)
+        if segment_end > segment_start:
+            duration_ms += segment_end - segment_start
+    return duration_ms
+
+
+def format_duration(duration_ms):
+    total_seconds = max(0, int(round(duration_ms / 1000)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def get_weekly_wind_stats(entity_type, entity_id, keys):
     wind_keys = [key for key in WIND_KEYS if key in keys]
     if not wind_keys:
-        return None
+        return {"max": None, "highWindDuration": zero_high_wind_duration()}
 
     def load():
         end_ts = int(time.time() * 1000)
@@ -303,10 +330,42 @@ def get_weekly_max_wind(entity_type, entity_id, keys):
             },
         )
         values = values if isinstance(values, dict) else {}
-        return pick_max(values, WIND_KEYS)
+
+        points_by_ts = {}
+        for key in wind_keys:
+            for item in values.get(key, []) or []:
+                numeric = number_value(item.get("value"))
+                ts = item.get("ts")
+                if numeric is None or ts is None:
+                    continue
+                ts = int(ts)
+                existing = points_by_ts.get(ts)
+                if existing is None or numeric > existing["value"]:
+                    points_by_ts[ts] = {"ts": ts, "value": numeric}
+
+        points = [points_by_ts[ts] for ts in sorted(points_by_ts)]
+        duration_ms = high_wind_duration(points, HIGH_WIND_THRESHOLD, start_ts, end_ts)
+        return {
+            "max": pick_max(values, WIND_KEYS),
+            "highWindDuration": {
+                "threshold": HIGH_WIND_THRESHOLD,
+                "durationMs": duration_ms,
+                "durationSeconds": round(duration_ms / 1000),
+                "formatted": format_duration(duration_ms),
+            },
+        }
 
     cache_key = ("weekly_max_wind", entity_type, entity_id, tuple(wind_keys))
     return cached_value(cache_key, WEEKLY_MAX_CACHE_SECONDS, load)
+
+
+def zero_high_wind_duration():
+    return {
+        "threshold": HIGH_WIND_THRESHOLD,
+        "durationMs": 0,
+        "durationSeconds": 0,
+        "formatted": format_duration(0),
+    }
 
 
 def get_wind_history(device, start_ts, end_ts):
@@ -389,7 +448,7 @@ def get_device_summary(device):
 
     voltage = pick_latest(values, VOLTAGE_KEYS)
     wind = pick_latest(values, WIND_KEYS)
-    weekly_max_wind = get_weekly_max_wind(entity_type, entity_id, keys)
+    weekly_wind_stats = get_weekly_wind_stats(entity_type, entity_id, keys)
     signal = pick_latest(values, SIGNAL_KEYS)
     last_telemetry_ts = latest_metric_ts(voltage, wind, signal)
     return {
@@ -397,7 +456,8 @@ def get_device_summary(device):
         "name": device.get("name"),
         "voltage": voltage,
         "wind": wind,
-        "weeklyMaxWind": weekly_max_wind,
+        "weeklyMaxWind": weekly_wind_stats["max"],
+        "weeklyHighWindDuration": weekly_wind_stats["highWindDuration"],
         "signal": signal,
         "lastTelemetryTs": last_telemetry_ts,
         "lastTelemetryTime": format_ts(last_telemetry_ts),
