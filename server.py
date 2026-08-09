@@ -309,18 +309,23 @@ def high_wind_periods(points, threshold, start_ts, end_ts):
                 "startTs": segment_start,
                 "endTs": segment_end,
                 "durationMs": segment_end - segment_start,
+                "values": [],
             }
             periods.append(active_period)
+        active_period["values"].append(current["value"])
 
     return {
         "durationMs": duration_ms,
         "periods": [
             {
-                **period,
+                "startTs": period["startTs"],
+                "endTs": period["endTs"],
+                "durationMs": period["durationMs"],
                 "startTime": format_ts(period["startTs"]),
                 "endTime": format_ts(period["endTs"]),
                 "durationSeconds": round(period["durationMs"] / 1000),
                 "formatted": format_duration(period["durationMs"]),
+                "avgWind": sum(period["values"]) / len(period["values"]) if period["values"] else None,
             }
             for period in periods
         ],
